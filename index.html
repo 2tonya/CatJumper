@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <!-- viewport-fit=cover нужен, чтобы --safe-* в style.css получил реальные insets -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0a0820">
+  <meta name="description" content="CatJumper — аркадный платформер про кота: прыгай по процедурным платформам как можно выше, собирай монеты и ставь рекорд.">
+  <title>CatJumper — прыгай выше</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="dark-theme">
+
+  <!-- Сцена: canvas + HUD + мобильные кнопки + оверлеи. Всё позиционируется CSS-ом. -->
+  <div id="app">
+
+    <canvas id="game" width="480" height="720" role="img"
+            aria-label="Игровое поле: кот прыгает по платформам вверх, собирает монеты и избегает шипов">
+      Ваш браузер не поддерживает canvas. Обновите браузер, чтобы играть в CatJumper.
+    </canvas>
+
+    <!-- HUD: три ячейки, значения (score/best/coins) пишет game.js.
+         Ячейки стилизуются через #hud > *, поэтому подписи живут в aria-label. -->
+    <div id="hud" role="group" aria-label="Показатели">
+      <div role="group" aria-label="Счёт"><span id="score">0</span></div>
+      <div role="group" aria-label="Рекорд"><span id="best">0</span></div>
+      <div role="group" aria-label="Монет собрано"><span id="coins">0</span></div>
+    </div>
+
+    <!-- Док кнопок у показателей. Сознательно ВНЕ #hud: ячейки HUD стилизуются
+         селектором `#hud > *`, и четвёртый ребёнок сломал бы сетку из трёх колонок.
+         КОНТРАКТ ДЛЯ style.css:
+           #hudActions — position: absolute; z-index: 4; pointer-events: none;
+                         right: <отступ #hud>; top: <строго ниже полосы #hud>;
+           #hudActions > * { pointer-events: auto; }
+           .btn.btn--icon — круглая кнопка-иконка с одним символом, ~44x44,
+                            правый край как у #hud, без перекрытия показателей. -->
+    <div id="hudActions">
+      <button type="button" class="btn btn--icon" id="btnMenu" aria-label="Выйти в меню">&larr;</button>
+    </div>
+
+    <!-- Сенсорное управление: на десктопе скрыто media-запросом в style.css -->
+    <div id="touchControls" role="group" aria-label="Сенсорное управление">
+      <button type="button" class="btn" id="btnLeft" aria-label="Влево">&larr;</button>
+      <button type="button" class="btn" id="btnRight" aria-label="Вправо">&rarr;</button>
+      <button type="button" class="btn btn--jump" id="btnJump" aria-label="Прыжок">ПРЫЖОК</button>
+    </div>
+
+    <!-- Главное меню. Прячется классом hidden из game.js при старте игры. -->
+    <div class="overlay" id="menu" role="dialog" aria-labelledby="menuTitle">
+      <div class="panel">
+        <h1 id="menuTitle">CatJumper</h1>
+        <p>Кот лезет вверх по бесконечной лестнице платформ. Чем выше — тем опаснее.</p>
+        <p class="hint">Розовые платформы подбрасывают, бежевые рассыпаются, шипы по краям кусаются.</p>
+        <ul>
+          <li><kbd>&larr;</kbd><kbd>&rarr;</kbd><kbd>A</kbd><kbd>D</kbd> — движение</li>
+          <li><kbd>Space</kbd><kbd>W</kbd> — прыжок</li>
+          <li>Второе нажатие — двойной прыжок</li>
+          <li>На сенсорном экране — кнопки под сценой</li>
+        </ul>
+        <!-- Ряд действий: главная кнопка и вторичная подсказка «!». -->
+        <div class="menu-actions">
+          <button type="button" class="btn btn--primary" id="btnStart">Играть</button>
+          <button type="button" class="btn btn--guide" id="btnGuide" aria-label="Как играть">!</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Гайд по управлению: открывается из меню, лежит поверх него.
+         Изначально скрыт классом hidden, game.js переключает видимость. -->
+    <div class="overlay hidden" id="guidePanel" role="dialog" aria-labelledby="guideTitle">
+      <div class="panel">
+        <h2 id="guideTitle">Как играть</h2>
+        <ul>
+          <li><kbd>&larr;</kbd><kbd>&rarr;</kbd><kbd>A</kbd><kbd>D</kbd> — движение</li>
+          <li><kbd>Space</kbd><kbd>W</kbd> — прыжок, второй раз — двойной прыжок</li>
+          <li>На сенсорных экранах — кнопки под сценой</li>
+        </ul>
+        <button type="button" class="btn btn--primary" id="btnGuideClose">Понятно</button>
+      </div>
+    </div>
+
+    <!-- Экран поражения. Изначально скрыт классом hidden, game.js показывает его после падения. -->
+    <div class="overlay hidden" id="over" role="dialog" aria-labelledby="overTitle">
+      <div class="panel">
+        <h2 id="overTitle">Кот упал</h2>
+        <p class="hint">Рекорд сохранён в этом браузере — попробуй забраться ещё выше.</p>
+        <p>Счёт: <span id="overScore">0</span></p>
+        <p>Монет: <span id="overCoins">0</span></p>
+        <p>Рекорд: <span id="overBest">0</span></p>
+        <ul>
+          <li><kbd>Enter</kbd> — ещё раз</li>
+        </ul>
+        <button type="button" class="btn btn--primary" id="btnRestart">Играть снова</button>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="game.js" defer></script>
+</body>
+</html>
