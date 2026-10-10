@@ -87,17 +87,29 @@
     HAZARD_W_MIN: 22, HAZARD_W_MAX: 38, HAZARD_H: 12,
     HAZARD_INSET: 5,         // inset по AABB, чтобы не было ложных срабатываний
     HAZARD_PLATFORM_MARGIN: 10,
+    HAZARD_PASS_GAP: 36,     // минимум свободного места между двумя шипами, px (> CAT_W)
 
     // Монеты
     COIN_R: 8, COIN_VALUE: 5, COIN_CHANCE: 0.42, COIN_COUNT_MAX: 3,
     COIN_SPACING: 24, COIN_HEIGHT: 48, COIN_INSET: 4,
 
     // Сложность (шансы растут с высотой)
-    DIFF_RAMP_M: 200,        // метров до максимальной сложности
-    CRUMBLE_CHANCE_MIN: 0.06, CRUMBLE_CHANCE_MAX: 0.30,
-    MOVING_CHANCE_MIN: 0.08, MOVING_CHANCE_MAX: 0.26,
+    // Кривая difficulty() — мягкий логарифм, а не линейная лестница: на
+    // DIFF_FULL_M очках сложность выходит на 1.0 и дальше продолжает расти
+    // логарифмически (3000 очков ≈ 1.58), поэтому потолка на 200 очках нет.
+    DIFF_RAMP_M: 110,        // масштаб логарифма: меньше — круче начало подъёма
+    DIFF_FULL_M: 800,        // очки, на которых сложность выходит на 1.0
+    // Шансы нестабильных платформ на пике: crumble + moving держатся в сумме
+    // <= 0.35, иначе казуальный игрок теряет контроль над лестницей.
+    CRUMBLE_CHANCE_MIN: 0.06, CRUMBLE_CHANCE_MAX: 0.19,
+    MOVING_CHANCE_MIN: 0.08, MOVING_CHANCE_MAX: 0.15,
     HAZARD_CHANCE_MIN: 0.05, HAZARD_CHANCE_MAX: 0.30,
     BOUNCY_CHANCE: 0.07,
+    // Хвост подъёма (overdrive 0..1 — это difficulty минус единица): опасность
+    // продолжает расти и ПОСЛЕ DIFF_FULL_M очков, плавно и без «стены» препятствий.
+    CRUMBLE_SPEEDUP: 0.25,   // насколько быстрее рассыпается crumble на пике
+    MOVING_SPEED_GAIN: 0.7,  // добавка к скорости moving, рад/с
+    HAZARD_DOUBLE_CHANCE: 0.5, // базовый шанс второго шипа на широкой платформе
 
     // Камера
     CAM_ANCHOR: 0.55,        // где по вертикали сидит кот в кадре
@@ -107,9 +119,15 @@
 
     // Смерть, счёт и рекорд
     DEATH_MARGIN: 140,       // падение ниже камеры на столько px = смерть
-    DEATH_SHOW_DELAY: 0.85,  // анимация падения до показа #over
+    DEATH_SHOW_DELAY: 0.45,  // анимация падения до показа #over (мёртвое время)
     METERS_PER_SCORE: 10,    // 10 px высоты = 1 «метр» счёта
-    BEST_KEY: 'catjumper.best',
+    // Версия 2: счёт стал только высотой, старый рекорд (высота + монеты)
+    // несопоставим с новым и переносится в другой ключ — см. loadBest().
+    BEST_KEY: 'catjumper.best.v2',
+
+    // Празднование рекорда (всё внутри канваса, задержки цикла не добавляет)
+    BEST_FX_FLASH: 0.45,     // длительность вспышки, с
+    BEST_CROWN_TIME: 5.0,    // сколько висит корона над котом, с
 
     // Частицы
     PARTICLE_CAP: 240, DUST_COUNT: 8, SPARK_COUNT: 8, SHARD_COUNT: 10,
@@ -143,6 +161,8 @@
 
   // Высота прыжка (~137px) — верхняя граница зазора между платформами
   const MAX_JUMP_HEIGHT = (CONFIG.JUMP_VELOCITY * CONFIG.JUMP_VELOCITY) / (2 * CONFIG.GRAVITY);
+  // Нормировка кривой сложности: подобрана так, что difficulty(DIFF_FULL_M) == 1.
+  const DIFF_GAIN = 1 / Math.log(1 + CONFIG.DIFF_FULL_M / CONFIG.DIFF_RAMP_M);
 
   // Насколько глубоко уже ушёл космос: 0 — сумеречное небо, 1 — чистый космос.
   function spaceBlend() {
@@ -179,10 +199,13 @@
     dom.canvas = document.getElementById('game');
     ['score', 'best', 'coins', 'menu', 'over', 'btnStart', 'btnRestart',
       'btnLeft', 'btnRight', 'btnJump', 'overBest', 'overScore', 'overCoins',
+      'overTitle',
       // Управляющие кнопки верхних панелей. Могут отсутствовать в разметке —
       // все обращения идут через listen(), который молча выходит.
       'btnMenu', 'btnGuide', 'btnGuideClose', 'guidePanel']
       .forEach((id) => { dom[id] = document.getElementById(id); });
+    // Подсказка на экране поражения — используем её для причины смерти.
+    dom.overHint = document.querySelector('#over .hint');
   }
 
   /** HUD и текстовые узлы — только textContent, с защитой от отсутствия узла. */
@@ -240,6 +263,8 @@
   let overShown = false;     // показан ли уже экран Game Over
   let deathReason = '';
   let newBest = false;
+  let bestFxTimer = 0;       // таймер вспышки при новом рекорде
+  let crownTimer = 0;        // таймер короны на экране поражения
 
   let dpr = 1;
   let skyGradient = null;
@@ -321,7 +346,11 @@
   }
 
   function onVisibilityChange() {
-    if (document.hidden && state === 'playing') togglePause();
+    if (document.hidden) {
+      if (state === 'playing') togglePause();
+    } else {
+      if (state === 'paused') resume();
+    }
   }
 
   function bindHoldButton(el, action) {
@@ -357,7 +386,9 @@
     listen(window, 'keydown', onKeyDown, { passive: false });
     listen(window, 'keyup', onKeyUp);
     listen(window, 'blur', onWindowBlur);
+    listen(window, 'focus', () => { if (state === 'paused') resume(); });
     listen(document, 'visibilitychange', onVisibilityChange);
+    listen(canvas, 'pointerdown', () => { if (state === 'paused') resume(); });
     listen(window, 'resize', resizeCanvas);
     bindHoldButton(dom.btnLeft, 'left');
     bindHoldButton(dom.btnRight, 'right');
@@ -416,13 +447,48 @@
     return x - Math.floor(x);
   }
 
-  /** Насколько сложно сейчас: 0 внизу, 1 на DIFF_RAMP_M метрах. */
-  function difficulty() {
-    return clamp(maxHeight / CONFIG.METERS_PER_SCORE / CONFIG.DIFF_RAMP_M, 0, 1);
+  /**
+   * Высота в очках по мировой Y. Ровно та же мера, что и счёт игрока: игрок
+   * приземляется на plat.y, поэтому -(p.y + p.h) == -plat.y (см. updatePlayer).
+   */
+  function heightScore(y) {
+    return Math.floor(-y / CONFIG.METERS_PER_SCORE);
+  }
+
+  /**
+   * Насколько сложно на этой высоте (height — очки, та же мера, что и счёт).
+   * Кривая — мягкий логарифм, а не clamp: 0 внизу, ровно 1.0 на DIFF_FULL_M
+   * очках (пик приходит на ~800 очках вместо 200), дальше уровень продолжает
+   * расти логарифмически — 1200 → ~1.17, 3000 → ~1.58. Поэтому плато в начале
+   * подъёма исчезло, а переходы нигде не идут ступеньками.
+   *
+   * Считается от высоты САМОЙ платформы, а не от прогресса игрока: генерация идёт
+   * пачками далеко впереди (SPAWN_AHEAD), и шансы, посчитанные от счёта игрока,
+   * «заражали» весь будущий участок. Хуже того, счёт обнуляется в buildWorld()
+   * уже ПОСЛЕ сборки мира, поэтому после смерти первые платформы нового захода
+   * рождались со сложностью и шипами прошлого захода.
+   */
+  function difficulty(height) {
+    return DIFF_GAIN * Math.log(1 + Math.max(0, height) / CONFIG.DIFF_RAMP_M);
+  }
+
+  /** Уровень для всех lerp'ов шансов: 0..1, без перелёта за максимум. */
+  function diffLevel(height) {
+    return clamp(difficulty(height), 0, 1);
+  }
+
+  /**
+   * Хвост подъёма: 0 на DIFF_FULL_M очках и плавно растёт до 1 дальше по высоте.
+   * Им раскручиваются только «темп» и плотность опасности (скорость crumble и
+   * moving, второй шип) — то, что не влияет на достижимость платформ.
+   */
+  function overdrive(height) {
+    return clamp(difficulty(height) - 1, 0, 1);
   }
 
   function makePlatform(x, y, w, type) {
-    const d = difficulty();
+    const height = heightScore(y);
+    const d = diffLevel(height);
     // Амплитуда ограничена так, чтобы вся орбита помещалась на экране:
     // иначе синус упирался бы в край и платформа «залипала» на границе.
     const maxAmp = Math.max(0, (CONFIG.VIEW_W - CONFIG.SIDE_MARGIN * 2 - w) / 2);
@@ -431,7 +497,12 @@
       x, y, w, h: CONFIG.PLATFORM_H, type,
       originX: x,                            // центр колебания для moving
       amp: type === 'moving' ? Math.min(lerp(CONFIG.MOVING_AMP_MIN, CONFIG.MOVING_AMP_MAX, d), maxAmp) : 0,
-      speed: type === 'moving' ? rand(CONFIG.MOVING_SPEED_MIN, CONFIG.MOVING_SPEED_MAX) : 0,
+      // На хвосте подъёма движущиеся платформы ещё и едут быстрее — от орбиты
+      // это ничего не ломает (достижимость считается по амплитуде, не по скорости).
+      speed: type === 'moving'
+        ? rand(CONFIG.MOVING_SPEED_MIN, CONFIG.MOVING_SPEED_MAX)
+          + overdrive(height) * CONFIG.MOVING_SPEED_GAIN
+        : 0,
       phase: Math.random() * Math.PI * 2,
       t: 0, dx: 0,
       state: 'idle',                         // 'idle' | 'crumbling' | 'gone'
@@ -497,8 +568,8 @@
     plat.x = plat.originX = baseX;
   }
 
-  function pickType() {
-    const d = difficulty();
+  function pickType(y) {
+    const d = diffLevel(heightScore(y));
     const roll = Math.random();
     let acc = lerp(CONFIG.CRUMBLE_CHANCE_MIN, CONFIG.CRUMBLE_CHANCE_MAX, d);
     if (roll < acc) return 'crumble';
@@ -510,10 +581,11 @@
 
   function spawnNext() {
     const prev = lastPlatform;
-    const d = difficulty();
-    const gap = rand(CONFIG.PLATFORM_GAP_MIN, lerp(CONFIG.PLATFORM_GAP_MIN, CONFIG.PLATFORM_GAP_MAX, d));
+    const gap = rand(CONFIG.PLATFORM_GAP_MIN,
+      lerp(CONFIG.PLATFORM_GAP_MIN, CONFIG.PLATFORM_GAP_MAX, diffLevel(heightScore(prev ? prev.y : 0))));
     const w = rand(CONFIG.PLATFORM_W_MIN, CONFIG.PLATFORM_W_MAX);
-    const plat = makePlatform((CONFIG.VIEW_W - w) / 2, prev ? prev.y - gap : -CONFIG.PLATFORM_GAP_SAFE, w, pickType());
+    const nextY = prev ? prev.y - gap : -CONFIG.PLATFORM_GAP_SAFE;
+    const plat = makePlatform((CONFIG.VIEW_W - w) / 2, nextY, w, pickType(nextY));
 
     placeReachable(prev, plat);
     // Вертикаль: зазор обязан остаться в пределах высоты прыжка (с запасом)
@@ -528,21 +600,43 @@
     topPlatformY = plat.y;
 
     // Шипы — только на solid/moving, не на первой платформе, с местом по краям.
-    // Первые HAZARD_MIN_SCORE очков карта идёт вообще без шипов: на старте кот
-    // ещё осваивается, и смерть «с первого прыжка» неуместна.
-    if (totalScore() >= CONFIG.HAZARD_MIN_SCORE
+    // Порог считаем от высоты САМОЙ платформы (уже с поправкой на вертикальный
+    // зажим выше), а не от счёта игрока: платформы строятся пачками далеко впереди,
+    // так что гейт по totalScore() помечал весь непроходимый ещё участок, а после
+    // смерти первые HAZARD_MIN_SCORE очков карты успевали получить шипы ещё до
+    // обнуления счёта — кот натыкался на шип с первого метра. Теперь правило
+    // детерминировано: высота либо шиповата, либо нет, независимо от истории захода.
+    const platScore = heightScore(plat.y);
+    if (platScore >= CONFIG.HAZARD_MIN_SCORE
       && (plat.type === 'solid' || plat.type === 'moving')) {
       const room = plat.w - CONFIG.HAZARD_PLATFORM_MARGIN * 2;
-      const chance = lerp(CONFIG.HAZARD_CHANCE_MIN, CONFIG.HAZARD_CHANCE_MAX, d);
+      const chance = lerp(CONFIG.HAZARD_CHANCE_MIN, CONFIG.HAZARD_CHANCE_MAX, diffLevel(platScore));
       if (platforms.length > 3 && room >= CONFIG.HAZARD_W_MIN && Math.random() < chance) {
         const hw = Math.min(rand(CONFIG.HAZARD_W_MIN, CONFIG.HAZARD_W_MAX), room);
+        const spikeLeft = Math.random() < 0.5;
         hazards.push({
           plat,
-          offsetX: Math.random() < 0.5
+          offsetX: spikeLeft
             ? CONFIG.HAZARD_PLATFORM_MARGIN
             : plat.w - CONFIG.HAZARD_PLATFORM_MARGIN - hw,
           w: hw, h: CONFIG.HAZARD_H,
         });
+        // Хвост подъёма: на пике изредка появляется второй шип — с другого края,
+        // и только если между зубьями остаётся HAZARD_PASS_GAP (> CAT_W).
+        // Плотность шипов на платформу растёт вместе с overdrive, а «стены шипов»
+        // не возникает: проём для приземления гарантирован.
+        const room2 = room - hw - CONFIG.HAZARD_PASS_GAP;
+        if (room2 >= CONFIG.HAZARD_W_MIN
+          && Math.random() < CONFIG.HAZARD_DOUBLE_CHANCE * overdrive(platScore)) {
+          const hw2 = Math.min(rand(CONFIG.HAZARD_W_MIN, CONFIG.HAZARD_W_MAX), room2);
+          hazards.push({
+            plat,
+            offsetX: spikeLeft
+              ? plat.w - CONFIG.HAZARD_PLATFORM_MARGIN - hw2
+              : CONFIG.HAZARD_PLATFORM_MARGIN,
+            w: hw2, h: CONFIG.HAZARD_H,
+          });
+        }
       }
     }
     if (Math.random() < CONFIG.COIN_CHANCE) spawnCoins(plat);
@@ -641,6 +735,7 @@
     shakeAmp = 0; shakeX = 0; shakeY = 0;
     maxHeight = 0; score = 0; coinScore = 0; coinsCollected = 0;
     dieTimer = 0; overShown = false; deathReason = ''; newBest = false;
+    bestFxTimer = 0; crownTimer = 0;
     trailTimer = 0;
   }
 
@@ -821,6 +916,16 @@
     }
   }
 
+  /**
+   * Задержка до разрушения crumble-платформы. Чем выше подъём, тем быстрее она
+   * рассыпается под лапами — на пике это часть «хвоста» кривой сложности.
+   * Нижняя граница — CRUMBLE_DELAY * (1 - CRUMBLE_SPEEDUP) ≈ 0.26 с,
+   * это всё ещё больше человеческой реакции.
+   */
+  function crumbleDelayFor(y) {
+    return CONFIG.CRUMBLE_DELAY * (1 - CONFIG.CRUMBLE_SPEEDUP * overdrive(heightScore(y)));
+  }
+
   function onLand(plat, impactVel) {
     const p = player;
     p.y = plat.y - p.h;
@@ -842,7 +947,7 @@
 
     if (plat.type === 'crumble' && plat.state === 'idle') {
       plat.state = 'crumbling';
-      plat.timer = CONFIG.CRUMBLE_DELAY;
+      plat.timer = crumbleDelayFor(plat.y);
     }
     if (plat.type === 'bouncy') {
       p.vy = CONFIG.BOUNCY_VELOCITY;
@@ -1560,6 +1665,40 @@
       ctx.fillText('ПАУЗА', CONFIG.VIEW_W / 2, CONFIG.VIEW_H / 2);
       ctx.restore();
     }
+
+    // Празднование рекорда: вспышка в момент смерти и корона на экране поражения.
+    if (bestFxTimer > 0) {
+      ctx.save();
+      ctx.globalAlpha = (bestFxTimer / CONFIG.BEST_FX_FLASH) * 0.6;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, CONFIG.VIEW_W, CONFIG.VIEW_H);
+      ctx.restore();
+    }
+    if (state === 'over' && overShown && crownTimer > 0) {
+      const alpha = clamp(crownTimer / CONFIG.BEST_CROWN_TIME, 0, 1);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(CONFIG.VIEW_W / 2, 50);
+      // Корона из треугольников
+      ctx.fillStyle = '#ffd44d';
+      ctx.beginPath();
+      ctx.moveTo(-24, 12);
+      ctx.lineTo(-24, -6);
+      ctx.lineTo(-12, 2);
+      ctx.lineTo(0, -12);
+      ctx.lineTo(12, 2);
+      ctx.lineTo(24, -6);
+      ctx.lineTo(24, 12);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = '#c98f10';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      // Блик
+      ctx.fillStyle = 'rgba(255,255,255,0.8)';
+      ctx.fillRect(-18, -8, 3, 3);
+      ctx.restore();
+    }
   }
 
   /* ===========================================================
@@ -1582,8 +1721,14 @@
     } catch (err) { /* хранилище может быть недоступно */ }
   }
 
+  /**
+   * Итоговый, РАНЖИРУЕМЫЙ счёт — только высота в очках.
+   * Очки за монеты живут отдельно (coinScore) и в счёт/рекорд не входят:
+   * иначе два игрока с одинаковой высотой получали бы разный счёт, и сравнивать
+   * их было бы бессмысленно. Монеты остаются в игре как статистика.
+   */
   function totalScore() {
-    return score + coinScore;
+    return score;
   }
 
   /** HUD пишем в DOM только при реальном изменении значения. */
@@ -1598,7 +1743,19 @@
   }
 
   function showOverPanel() {
-    setText(dom.overBest, best);
+    // Причина смерти — короткой строкой в .hint (или в #overTitle, если .hint нет).
+    const reasonText = deathReason === 'spike' ? 'Съел шип.'
+      : (deathReason === 'fall' ? 'Не долетел до крыши.' : '');
+    if (dom.overHint) setText(dom.overHint, reasonText);
+    else if (dom.overTitle) setText(dom.overTitle, 'Кот упал — ' + reasonText.toLowerCase());
+
+    // Празднование рекорда: корона и отметка в #overBest.
+    if (newBest) {
+      crownTimer = CONFIG.BEST_CROWN_TIME;
+      setText(dom.overBest, 'НОВЫЙ РЕКОРД: ' + best);
+    } else {
+      setText(dom.overBest, best);
+    }
     if (dom.overScore) setText(dom.overScore, totalScore());
     if (dom.overCoins) setText(dom.overCoins, coinsCollected);
     setOverlay(dom.over, true);
@@ -1670,6 +1827,7 @@
     if (newBest) {
       best = final;
       saveBest();
+      bestFxTimer = CONFIG.BEST_FX_FLASH;
     }
     updateHud();
     spawnSparks(player.x + player.w / 2, player.y + player.h / 2, CONFIG.SPARK_COUNT, 0);
@@ -1702,6 +1860,8 @@
 
   function update(dt) {
     bgTime += dt;
+    if (bestFxTimer > 0) bestFxTimer = Math.max(0, bestFxTimer - dt);
+    if (crownTimer > 0) crownTimer = Math.max(0, crownTimer - dt);
 
     if (state === 'playing') {
       if (input.jumpBuffer > 0) input.jumpBuffer = Math.max(0, input.jumpBuffer - dt);
